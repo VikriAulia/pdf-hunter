@@ -11,8 +11,24 @@ from collections import deque
 from datetime import datetime
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlunparse
+import logging
+import time
+import hashlib
+import json
+import PyPDF2
+import threading
+import concurrent.futures
+try:
+    from pdf2image import convert_from_path
+    from PIL import Image
+    import pytesseract
+    OCR_AVAILABLE = True
+except Exception:
+    OCR_AVAILABLE = False
 
 # Default configuration
 DEFAULT_URL = "https://ppid.unp.ac.id/"
@@ -105,6 +121,94 @@ def normalize_pdf_url(pdf_url):
     return normalized
 
 
+def extract_pdf_metadata_text(filepath, ocr_enabled=False, ocr_pages=3):
+    """Extract basic metadata and text from a PDF using PyPDF2."""
+    meta = {}
+    text_snippet = ""
+    try:
+        with open(filepath, 'rb') as fh:
+            reader = PyPDF2.PdfReader(fh)
+            docinfo = reader.metadata
+            if docinfo:
+                # convert keys to simple names
+                try:
+                    meta = {k[1:]: v for k, v in docinfo.items()}
+                except Exception:
+                    meta = {}
+
+            # extract text from first few pages (limit to speed)
+            texts = []
+            for i, page in enumerate(reader.pages):
+                if i >= 3:
+                    break
+                try:
+                    t = page.extract_text() or ""
+                    texts.append(t)
+                except Exception:
+                    continue
+            text_snippet = "\n".join(texts).strip()
+            # If no usable text and OCR requested, try OCR fallback
+            if (not text_snippet or len(text_snippet.strip()) < 50) and ocr_enabled and OCR_AVAILABLE:
+                try:
+                    ocr_text = ocr_pdf(filepath, max_pages=ocr_pages)
+                    if ocr_text:
+                        text_snippet = ocr_text
+                        meta['ocr_used'] = True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return meta, text_snippet
+
+
+def ocr_pdf(filepath, max_pages=3, dpi=200):
+    """Render PDF pages to images and run Tesseract OCR. Requires poppler and tesseract installed."""
+    if not OCR_AVAILABLE:
+        raise RuntimeError("OCR dependencies not available (pytesseract/pdf2image).")
+
+    texts = []
+    try:
+        images = convert_from_path(filepath, dpi=dpi, first_page=1, last_page=max_pages)
+        for img in images:
+            try:
+                txt = pytesseract.image_to_string(img)
+                texts.append(txt)
+            except Exception:
+                continue
+    except Exception as e:
+        logging.warning(f"OCR conversion failed for {filepath}: {e}")
+
+    return "\n".join(texts).strip()
+
+
+def make_session(retry_total=3, backoff_factor=1):
+    """Create a configured requests.Session with retry strategy."""
+    s = requests.Session()
+    s.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/115.0 Safari/537.36"
+        }
+    )
+    status_forcelist = (429, 500, 502, 503, 504)
+    retry_strategy = Retry(
+        total=retry_total,
+        status_forcelist=status_forcelist,
+        allowed_methods=["HEAD", "GET", "OPTIONS"],
+        backoff_factor=backoff_factor,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+# Lock to protect shared records across threads
+records_lock = threading.Lock()
+
+
 def extract_pdf_candidates(html, soup, base_url):
     """Extract PDF URL candidates from HTML attributes and raw text."""
     candidates = set()
@@ -178,7 +282,7 @@ def extract_internal_links(soup, base_url, base_domain):
     return sorted(links)
 
 
-def crawl_pages_for_pdfs(session, start_urls, recursive, max_depth, max_pages):
+def crawl_pages_for_pdfs(session, start_urls, recursive, max_depth, max_pages, request_delay=0.0):
     """Crawl pages and collect PDF URLs from the same site."""
     visited_pages = set()
     pdf_urls = {}
@@ -196,6 +300,7 @@ def crawl_pages_for_pdfs(session, start_urls, recursive, max_depth, max_pages):
             response = session.get(page_url, timeout=20)
             response.raise_for_status()
         except Exception as error:
+            logging.warning(f"Failed to fetch page {page_url}: {error}")
             print(f"Failed to fetch page {page_url}: {error}")
             continue
 
@@ -216,6 +321,10 @@ def crawl_pages_for_pdfs(session, start_urls, recursive, max_depth, max_pages):
             for internal_page in internal_pages:
                 if internal_page not in visited_pages:
                     queue.append((internal_page, depth + 1))
+
+        # respect simple rate limiting between page requests
+        if request_delay and request_delay > 0:
+            time.sleep(request_delay)
 
     return pdf_urls
 
@@ -275,31 +384,118 @@ def generate_html_report(report_path, records):
         report_file.write(html)
 
 
-def download_pdf(session, pdf_url, folder, source_page, records):
-    """Download a single PDF file to the specified folder."""
+def download_pdf(session, pdf_url, folder, source_page, records, max_retries=3, backoff_factor=1.0, ocr_enabled=False, ocr_pages=3):
+    """Download a single PDF file to the specified folder with resume and retries."""
     filename = get_pdf_filename(pdf_url, folder)
+    temp_path = filename + ".part"
 
+    # Determine existing size for resume
+    existing_size = 0
+    if os.path.exists(temp_path):
+        existing_size = os.path.getsize(temp_path)
+
+    # Try HEAD to get total size and content type
+    total_size = None
+    accept_ranges = False
+    content_type = None
+    ct = None
     try:
-        with session.get(pdf_url, timeout=20, stream=True) as pdf_response:
-            pdf_response.raise_for_status()
-            with open(filename, 'wb') as output_file:
-                for chunk in pdf_response.iter_content(chunk_size=8192):
-                    if chunk:
-                        output_file.write(chunk)
-        downloaded_pdfs.append(filename)
-        downloaded_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        records.append(
-            {
-                "filename": os.path.basename(filename),
-                "filepath": filename,
-                "pdf_url": pdf_url,
-                "source_page": source_page,
-                "downloaded_at": downloaded_at,
-            }
-        )
-        print(f"  Saved to: {filename}")
-    except Exception as error:
-        print(f"Failed to download {pdf_url}: {error}")
+        head = session.head(pdf_url, timeout=15, allow_redirects=True)
+        if head.status_code == 200:
+            content_type = head.headers.get('Content-Type', '')
+            cl = head.headers.get('Content-Length')
+            if cl and cl.isdigit():
+                total_size = int(cl)
+            if head.headers.get('Accept-Ranges', '').lower() in ('bytes', 'yes'):
+                accept_ranges = True
+    except Exception:
+        pass
+
+    # If file already exists and size matches, skip
+    if os.path.exists(filename):
+        try:
+            if total_size is None or os.path.getsize(filename) == total_size:
+                logging.info(f"File exists and matches size, skipping: {filename}")
+                print(f"Skipping (already downloaded): {filename}")
+                return
+        except Exception:
+            pass
+
+    attempt = 0
+    while attempt <= max_retries:
+        try:
+            headers = {}
+            mode = 'wb'
+            if existing_size and accept_ranges:
+                headers['Range'] = f'bytes={existing_size}-'
+                mode = 'ab'
+
+            with session.get(pdf_url, headers=headers, timeout=30, stream=True) as resp:
+                resp.raise_for_status()
+                # validate content-type early
+                ct = resp.headers.get('Content-Type', '')
+                if ct and 'pdf' not in ct.lower():
+                    logging.warning(f"Content-Type for {pdf_url} is {ct}")
+
+                # write to temp file (append if resuming)
+                with open(temp_path, mode) as out_f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            out_f.write(chunk)
+
+            # After download, move temp to final
+            # Validate magic bytes
+            valid = False
+            try:
+                with open(temp_path, 'rb') as chk:
+                    start = chk.read(5)
+                    if start.startswith(b'%PDF'):
+                        valid = True
+            except Exception:
+                valid = False
+
+            if not valid:
+                logging.warning(f"Downloaded file failed PDF magic check: {pdf_url}")
+                # If invalid, remove temp and raise
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+                raise ValueError('Invalid PDF content')
+
+            os.replace(temp_path, filename)
+
+            # record metadata and text
+            with records_lock:
+                downloaded_pdfs.append(filename)
+            downloaded_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            meta, text_snippet = extract_pdf_metadata_text(filename, ocr_enabled=ocr_enabled, ocr_pages=ocr_pages)
+            with records_lock:
+                records.append(
+                    {
+                        "filename": os.path.basename(filename),
+                        "filepath": filename,
+                        "pdf_url": pdf_url,
+                        "source_page": source_page,
+                        "downloaded_at": downloaded_at,
+                        "content_type": content_type or ct,
+                        "size": os.path.getsize(filename),
+                        "metadata": meta,
+                        "text_snippet": text_snippet[:200],
+                    }
+                )
+            print(f"  Saved to: {filename}")
+            logging.info(f"Downloaded: {pdf_url} -> {filename}")
+            return
+        except Exception as error:
+            attempt += 1
+            wait = backoff_factor * (2 ** (attempt - 1))
+            logging.warning(f"Attempt {attempt} failed for {pdf_url}: {error}; retrying in {wait}s")
+            if attempt > max_retries:
+                logging.error(f"Exceeded retries for {pdf_url}")
+                print(f"Failed to download after retries: {pdf_url}")
+                return
+            time.sleep(wait)
 
 
 def main():
@@ -336,6 +532,17 @@ def main():
         default=None,
         help="Maximum number of pages to crawl when recursive scanning.",
     )
+    parser.add_argument(
+        "--ocr",
+        action="store_true",
+        help="Enable OCR fallback for scanned PDFs (requires Tesseract & poppler).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel download workers (default: 1 or env PDF_SCRAPER_WORKERS).",
+    )
     args = parser.parse_args()
 
     env_urls = os.getenv("PDF_SCRAPER_URLS")
@@ -350,6 +557,9 @@ def main():
     recursive = args.recursive or parse_bool_env("PDF_SCRAPER_RECURSIVE")
     max_depth = args.max_depth if args.max_depth is not None else parse_int_env("PDF_SCRAPER_MAX_DEPTH", DEFAULT_MAX_DEPTH)
     max_pages = args.max_pages if args.max_pages is not None else parse_int_env("PDF_SCRAPER_MAX_PAGES", DEFAULT_MAX_PAGES)
+    ocr_enabled = args.ocr or parse_bool_env("PDF_SCRAPER_OCR")
+    ocr_pages = parse_int_env("PDF_SCRAPER_OCR_PAGES", 3)
+    workers = args.workers if args.workers is not None else parse_int_env("PDF_SCRAPER_WORKERS", 1)
 
     if not os.path.exists(folder_location):
         os.makedirs(folder_location, exist_ok=True)
@@ -362,12 +572,40 @@ def main():
         }
     )
 
+    # Configure retries and backoff for the session
+    retry_total = parse_int_env("PDF_SCRAPER_RETRY_TOTAL", 3)
+    backoff_factor = parse_int_env("PDF_SCRAPER_BACKOFF_FACTOR", 1)
+    status_forcelist = (429, 500, 502, 503, 504)
+    retry_strategy = Retry(
+        total=retry_total,
+        status_forcelist=status_forcelist,
+        allowed_methods=["HEAD", "GET", "OPTIONS"],
+        backoff_factor=backoff_factor,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    # Rate limiting between requests (seconds)
+    request_delay = float(os.getenv("PDF_SCRAPER_REQUEST_DELAY", "0.5"))
+
+    # Setup basic logging to file inside output folder
+    log_path = os.path.join(folder_location, "scraper.log")
+    logging.basicConfig(
+        filename=log_path,
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    logging.info("Starting PDF Hunter run")
+
     pdf_urls = crawl_pages_for_pdfs(
         session,
         urls,
         recursive=recursive,
         max_depth=max_depth,
         max_pages=max_pages,
+        request_delay=request_delay,
     )
 
     if not pdf_urls:
@@ -376,14 +614,60 @@ def main():
 
     print(f"Found {len(pdf_urls)} PDF URL(s). Starting download...")
     downloaded_records = []
-    for index, (normalized_url, (pdf_url, source_page)) in enumerate(pdf_urls.items(), start=1):
-        print(f"Downloading ({index}/{len(pdf_urls)}): {pdf_url}")
-        download_pdf(session, pdf_url, folder_location, source_page, downloaded_records)
+
+    # Parallel download worker function
+    def _download_task(task):
+        pdf_url, source_page = task
+        s = make_session(retry_total=retry_total, backoff_factor=backoff_factor)
+        try:
+            download_pdf(
+                s,
+                pdf_url,
+                folder_location,
+                source_page,
+                downloaded_records,
+                max_retries=retry_total,
+                backoff_factor=backoff_factor,
+                ocr_enabled=ocr_enabled,
+                ocr_pages=ocr_pages,
+            )
+        except Exception as e:
+            logging.exception(f"Worker failed for {pdf_url}: {e}")
+
+    tasks = [(v[0], v[1]) for v in pdf_urls.values()]
+    if workers and workers > 1:
+        print(f"Downloading with {workers} workers...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = []
+            for index, task in enumerate(tasks, start=1):
+                pdf_url, _ = task
+                print(f"Queueing ({index}/{len(tasks)}): {pdf_url}")
+                futures.append(executor.submit(_download_task, task))
+
+            # wait for completion and raise if any exceptions
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+    else:
+        for index, task in enumerate(tasks, start=1):
+            pdf_url, source_page = task
+            print(f"Downloading ({index}/{len(tasks)}): {pdf_url}")
+            _download_task(task)
 
     if downloaded_pdfs:
         print(f"\n{len(downloaded_pdfs)} PDF file(s) downloaded.")
         report_path = os.path.join(folder_location, "pdf_download_report.html")
         generate_html_report(report_path, downloaded_records)
+        # save index JSON
+        index_path = os.path.join(folder_location, "pdf_index.json")
+        try:
+            with open(index_path, 'w', encoding='utf-8') as jf:
+                json.dump(downloaded_records, jf, ensure_ascii=False, indent=2)
+            logging.info(f"Index saved: {index_path}")
+        except Exception as e:
+            logging.warning(f"Failed to save index: {e}")
         print(f"Report generated: {report_path}")
     else:
         print("\nNo PDF files downloaded.")
