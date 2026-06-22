@@ -1,0 +1,20 @@
+# Preset for scraping UNP PPID pages.
+output: ./Downloads/ppid
+recursive: true
+max_depth: 3
+max_pages: 250
+workers: 4
+incremental: true
+
+feed:
+  enabled: true
+  title: "PPID UNP PDF Feed"
+  description: "Latest PDFs harvested from PPID Universitas Negeri Padang"
+  link: "https://ppid.unp.ac.id/"
+  author: "PDF Hunter"
+
+webhook:
+  enabled: false
+
+cloud:
+  enabled: false

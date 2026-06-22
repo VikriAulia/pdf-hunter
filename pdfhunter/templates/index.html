@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PDF Hunter</title>
+<style>
+body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #0f1115; color: #e6e6e7; }
+header { padding: 1rem 1.5rem; background: #11151c; border-bottom: 1px solid #222; display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+header h1 { margin: 0; font-size: 1.2rem; }
+header nav a { color: #6ea8fe; text-decoration: none; margin-left: 1rem; }
+main { padding: 1.5rem; max-width: 1200px; margin: auto; display: grid; gap: 1rem; }
+section { background: #161b24; padding: 1rem; border-radius: 8px; border: 1px solid #222; }
+.row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; }
+button { background: #1e6feb; color: #fff; border: 0; padding: .55rem .95rem; border-radius: 6px; cursor: pointer; }
+button.secondary { background: #30363d; }
+input, select, textarea { background: #0b0d12; color: #e6e6e7; border: 1px solid #30363d; border-radius: 4px; padding: .5rem .6rem; width: 100%; box-sizing: border-box; }
+textarea { min-height: 110px; resize: vertical; }
+label { display: flex; flex-direction: column; gap: 5px; font-size: .9rem; }
+.grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .75rem; }
+.status { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: .8rem; }
+.status.ok { background: #1f5132; color: #d4f4dd; }
+.status.error { background: #6b1f1f; color: #ffd5d5; }
+.status.running { background: #143a78; color: #cfe1eff; }
+a { color: #6ea8fe; }
+table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+th, td { padding: 8px; border-bottom: 1px solid #222; text-align: left; }
+.scroll { max-height: 320px; overflow: auto; }
+small { color: #9fb3c8; }
+pre { background: #0b0d12; padding: .8rem; border-radius: 6px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+.field-note { color: #9fb3c8; font-size: .85rem; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>PDF Hunter</h1>
+    <small>Web control & search dashboard</small>
+  </div>
+  <nav>
+    <a href="/report" target="_blank">HTML report</a>
+    <a href="/index.json" target="_blank">JSON index</a>
+    <a href="/feed.atom.xml" target="_blank">Atom feed</a>
+    <a href="/api/health" target="_blank">Health</a>
+  </nav>
+</header>
+<main>
+  <section>
+    <h2>Status</h2>
+    {% set status = last_run.status if last_run.status is defined else 'never' %}
+    <p>Last run: <span class="status {% if status == 'ok' %}ok{% elif status == 'error' %}error{% else %}running{% endif %}">{{ status }}</span>
+      {% if last_run.last_run %}<small>({{ last_run.last_run }})</small>{% endif %}</p>
+    <div class="grid-2">
+      <div><strong>Pages crawled</strong><br>{{ last_run.pages_crawled or 0 }}</div>
+      <div><strong>Files downloaded</strong><br>{{ last_run.files_downloaded or 0 }}</div>
+      <div><strong>Duration</strong><br>{{ '%.1f' % (last_run.duration_seconds or 0) }} s</div>
+      <div><strong>Known files</strong><br>{% if state.downloaded %}{{ state.downloaded | length }}{% else %}0{% endif %}</div>
+    </div>
+    {% if last_run.error %}<p style="color:#ffb3b3;"><strong>Error:</strong> {{ last_run.error }}</p>{% endif %}
+  </section>
+
+  <section>
+    <h2>Run & configuration</h2>
+    <form id="run-form">
+      <div class="grid-2">
+        <label>URLs (one per line)
+          <textarea id="urls">{{ config.urls | join('\n') }}</textarea>
+        </label>
+        <label>Output folder<input id="output" value="{{ config.output }}"></label>
+        <label>Max pages<input id="max_pages" type="number" value="{{ config.max_pages }}" min="1"></label>
+        <label>Max depth<input id="max_depth" type="number" value="{{ config.max_depth }}" min="0"></label>
+        <label>Workers<input id="workers" type="number" value="{{ config.workers }}" min="1"></label>
+        <label>Recursive
+          <select id="recursive">
+            <option value="true" {% if config.recursive %}selected{% endif %}>true</option>
+            <option value="false" {% if not config.recursive %}selected{% endif %}>false</option>
+          </select>
+        </label>
+        <label>OCR
+          <select id="ocr">
+            <option value="true" {% if config.ocr %}selected{% endif %}>true</option>
+            <option value="false" {% if not config.ocr %}selected{% endif %}>false</option>
+          </select>
+        </label>
+        <label>Incremental
+          <select id="incremental">
+            <option value="true" {% if config.incremental %}selected{% endif %}>true</option>
+            <option value="false" {% if not config.incremental %}selected{% endif %}>false</option>
+          </select>
+        </label>
+      </div>
+      <div class="row" style="margin-top:.8rem;">
+        <button type="submit">Start job</button>
+        <button type="button" class="secondary" id="dry-run-button">Dry run</button>
+        <button type="button" class="secondary" id="refresh-button">Refresh</button>
+      </div>
+      <p id="job-status" class="field-note"></p>
+    </form>
+  </section>
+
+  <section>
+    <h2>Search index</h2>
+    <form id="search-form" class="row">
+      <input id="search-query" type="search" placeholder="Cari filename, URL, atau source page" style="flex:1; min-width:220px;">
+      <button type="submit">Search</button>
+    </form>
+    <p id="search-meta" class="field-note"></p>
+    <div class="scroll">
+      <table id="search-results">
+        <thead><tr><th>Filename</th><th>Downloaded At</th><th>Source</th><th>PDF URL</th><th>Saved Path</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Recent jobs</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>ID</th><th>Status</th><th>Files</th><th>Duration</th><th>Started</th></tr></thead>
+        <tbody>
+        {% for j in jobs %}
+          <tr>
+            <td><a href="/api/jobs/{{ j.id }}" target="_blank">{{ j.id }}</a></td>
+            <td><span class="status {% if j.status == 'ok' %}ok{% elif j.status == 'error' %}error{% else %}running{% endif %}">{{ j.status }}</span></td>
+            <td>{{ j.files_downloaded or '' }}</td>
+            <td>{{ '%.1f' % (j.duration_seconds or 0) }} s</td>
+            <td><small>{{ j.started_at }}</small></td>
+          </tr>
+        {% else %}
+          <tr><td colspan="5">No jobs yet</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Log & webhook test</h2>
+    <div class="row" style="margin-bottom:.75rem;">
+      <button type="button" class="secondary" id="refresh-log">Refresh log</button>
+      <button type="button" class="secondary" id="load-state">Load state</button>
+    </div>
+    <pre id="log-output">Log output will appear here.</pre>
+    <pre id="state-output" style="display:none; margin-top:.75rem; background:#0b0d12; border-radius:6px; padding:.8rem;"></pre>
+    <form id="wh-form" style="margin-top:1rem;">
+      <label>Discord URL<input id="discord" placeholder="https://discord.com/api/webhooks/..." autocapitalize="none"></label>
+      <label>Slack URL<input id="slack" placeholder="https://hooks.slack.com/..." autocapitalize="none"></label>
+      <div class="row">
+        <input id="tt" placeholder="Telegram bot token" style="flex:1; min-width:220px;" autocapitalize="none">
+        <input id="tc" placeholder="Telegram chat ID" style="flex:1; min-width:220px;" autocapitalize="none">
+      </div>
+      <label>Message<input id="msg" value="PDF Hunter webhook test OK"></label>
+      <div class="row" style="margin-top:.6rem;"><button type="submit">Send test</button></div>
+      <pre id="wh-result" style="display:none; margin-top:.75rem;"></pre>
+    </form>
+  </section>
+</main>
+<script>
+function parseUrls(text) {
+  return text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+async function postJson(path, body) {
+  const resp = await fetch(path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  return resp.json();
+}
+
+const runForm = document.getElementById('run-form');
+runForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const urls = parseUrls(document.getElementById('urls').value);
+  const body = {
+    urls,
+    output: document.getElementById('output').value,
+    recursive: document.getElementById('recursive').value === 'true',
+    max_depth: Number(document.getElementById('max_depth').value),
+    max_pages: Number(document.getElementById('max_pages').value),
+    workers: Number(document.getElementById('workers').value),
+    ocr: document.getElementById('ocr').value === 'true',
+    incremental: document.getElementById('incremental').value === 'true',
+  };
+  const data = await postJson('/api/jobs', body);
+  document.getElementById('job-status').textContent = data.job_id ? `Job started: ${data.job_id}` : 'Job failed to start';
+});
+
+const dryRunButton = document.getElementById('dry-run-button');
+dryRunButton.addEventListener('click', async () => {
+  const urls = parseUrls(document.getElementById('urls').value);
+  const body = {
+    urls,
+    recursive: document.getElementById('recursive').value === 'true',
+    max_depth: Number(document.getElementById('max_depth').value),
+    max_pages: Number(document.getElementById('max_pages').value),
+  };
+  const data = await postJson('/api/dry-run', body);
+  document.getElementById('job-status').textContent = `Dry run found ${data.found || 0} PDF(s)`;
+});
+
+document.getElementById('refresh-button').addEventListener('click', () => window.location.reload());
+
+const searchForm = document.getElementById('search-form');
+searchForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const query = document.getElementById('search-query').value.trim();
+  const resp = await fetch(`/api/search?q=${encodeURIComponent(query)}&limit=200`);
+  const data = await resp.json();
+  const tbody = document.querySelector('#search-results tbody');
+  tbody.innerHTML = '';
+  document.getElementById('search-meta').textContent = `Found ${data.total} result(s)`;
+  for (const rec of data.results) {
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td>${rec.filename || ''}</td>
+      <td>${rec.downloaded_at || ''}</td>
+      <td><a href="${rec.source_page || '#'}" target="_blank">source</a></td>
+      <td><a href="${rec.pdf_url || '#'}" target="_blank">pdf</a></td>
+      <td>${rec.filepath || ''}</td>
+    `;
+    tbody.appendChild(row);
+  }
+});
+
+const refreshLog = document.getElementById('refresh-log');
+refreshLog.addEventListener('click', async () => {
+  const resp = await fetch('/log');
+  const data = await resp.json();
+  document.getElementById('log-output').textContent = data.log || 'No log available.';
+});
+
+const loadState = document.getElementById('load-state');
+loadState.addEventListener('click', async () => {
+  const resp = await fetch('/api/state');
+  const data = await resp.json();
+  const container = document.getElementById('state-output');
+  container.style.display = 'block';
+  container.textContent = JSON.stringify(data, null, 2);
+});
+
+const whForm = document.getElementById('wh-form');
+whForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const body = {
+    discord_url: document.getElementById('discord').value,
+    slack_url: document.getElementById('slack').value,
+    telegram_token: document.getElementById('tt').value,
+    telegram_chat_id: document.getElementById('tc').value,
+    message: document.getElementById('msg').value,
+  };
+  const data = await postJson('/api/webhook/test', body);
+  const pre = document.getElementById('wh-result');
+  pre.style.display = 'block';
+  pre.textContent = JSON.stringify(data, null, 2);
+});
+
+refreshLog.click();
+</script>
+</body>
+</html>

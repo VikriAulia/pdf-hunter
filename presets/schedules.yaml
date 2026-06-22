@@ -1,0 +1,12 @@
+# Multi-schedule configuration for PDF Hunter.
+# Each schedule can override the base config via ``preset``.
+# `python -m pdfhunter.scheduler` reads this file (and PDF_SCRAPER_SCHEDULES env).
+schedules:
+  - name: daily-ppid
+    cron: "0 2 * * *"
+    preset: default
+    enabled: true
+  - name: weekly-deep
+    cron: "0 3 * * 0"
+    preset: default
+    enabled: true

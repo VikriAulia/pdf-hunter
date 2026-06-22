@@ -1,0 +1,19 @@
+# Default preset for the PDF Hunter scheduler / runner.
+# Used when `python -m pdfhunter --preset default` is invoked.
+output: ./Downloads
+recursive: false
+max_depth: 2
+max_pages: 100
+workers: 2
+incremental: true
+
+feed:
+  enabled: false
+  title: "PDF Hunter Feed"
+  description: "Latest PDF documents harvested by PDF Hunter"
+
+webhook:
+  enabled: false
+
+cloud:
+  enabled: false
